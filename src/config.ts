@@ -9,7 +9,7 @@ const VALID_TEMPORALITIES: ReadonlySet<MetricsTemporality> = new Set<MetricsTemp
 export type PluginConfig = {
   enabled: boolean
   endpoint: string
-  protocol: "grpc" | "http/protobuf"
+  protocol: "grpc" | "http/protobuf" | "http/json"
   metricsInterval: number
   logsInterval: number
   metricPrefix: string
@@ -78,7 +78,11 @@ export function loadConfig(): PluginConfig {
   return {
     enabled: !!process.env["OPENCODE_ENABLE_TELEMETRY"],
     endpoint: process.env["OPENCODE_OTLP_ENDPOINT"] ?? "http://localhost:4317",
-    protocol: protocol === "http/protobuf" ? "http/protobuf" : "grpc",
+    protocol: protocol === "http/protobuf"
+      ? "http/protobuf"
+      : protocol === "http/json"
+        ? "http/json"
+        : "grpc",
     metricsInterval: parseEnvInt("OPENCODE_OTLP_METRICS_INTERVAL", 60000),
     logsInterval: parseEnvInt("OPENCODE_OTLP_LOGS_INTERVAL", 5000),
     metricPrefix: process.env["OPENCODE_METRIC_PREFIX"] ?? "opencode.",
