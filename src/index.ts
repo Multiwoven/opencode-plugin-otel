@@ -86,6 +86,10 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
 
   const instruments = createInstruments(config.metricPrefix)
   const logger = logs.getLogger("com.opencode")
+  const emitLog: HandlerContext["emitLog"] = (record) => {
+    if (!config.logsEnabled) return
+    logger.emit(record)
+  }
   const tracer = trace.getTracer("com.opencode")
   const pendingToolSpans = new Map()
   const pendingPermissions = new Map()
@@ -106,9 +110,13 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
     await log("info", "traces disabled", { disabled: [...disabledTraces] })
   }
 
+  if (!config.logsEnabled) {
+    await log("info", "OTLP log events disabled")
+  }
+
   const ctx: HandlerContext = {
-    logger,
     log,
+    emitLog,
     instruments,
     commonAttrs,
     pendingToolSpans,
@@ -183,7 +191,7 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
       }).filter(Boolean).join("\n")
       sessionInputs.set(input.sessionID, promptText)
       const promptLength = promptText.length
-      logger.emit({
+      emitLog({
         severityNumber: SeverityNumber.INFO,
         severityText: "INFO",
         timestamp: Date.now(),
