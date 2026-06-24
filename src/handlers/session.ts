@@ -1,11 +1,81 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
-import { SpanStatusCode, trace } from "@opentelemetry/api"
+import { SpanStatusCode } from "@opentelemetry/api"
 import type { EventSessionCreated, EventSessionIdle, EventSessionError, EventSessionStatus } from "@opencode-ai/sdk"
-import { AGENT_NAME, OpenInferenceSpanKind, SemanticConventions, SESSION_ID } from "@arizeai/openinference-semantic-conventions"
-import { agentAttrs, errorSummary, getSessionAgentMeta, setBoundedMap, isMetricEnabled, isTraceEnabled } from "../util.ts"
+import {
+  AGENT_NAME,
+  INPUT_MIME_TYPE,
+  INPUT_VALUE,
+  LLM_INPUT_MESSAGES,
+  MimeType,
+  OpenInferenceSpanKind,
+  SemanticConventions,
+  SESSION_ID,
+} from "@arizeai/openinference-semantic-conventions"
+import {
+  agentAttrs,
+  errorSummary,
+  getSessionAgentMeta,
+  setBoundedMap,
+  isMetricEnabled,
+  isTraceEnabled,
+  resolveSessionTraceContext,
+} from "../util.ts"
 import type { HandlerContext, SessionAgentType } from "../types.ts"
 
 const OPENINFERENCE_SPAN_KIND = SemanticConventions.OPENINFERENCE_SPAN_KIND
+
+export function handleRunStarted(
+  sessionID: string,
+  agent: string,
+  promptText: string,
+  model: string,
+  startTime: number,
+  ctx: HandlerContext,
+) {
+  if (!isTraceEnabled("session", ctx)) return
+  const existing = ctx.runSpans.get(sessionID)
+  if (existing) {
+    existing.setAttributes({
+      [AGENT_NAME]: agent,
+      ...(promptText
+        ? {
+            [INPUT_VALUE]: promptText,
+            [INPUT_MIME_TYPE]: MimeType.TEXT,
+            [LLM_INPUT_MESSAGES]: JSON.stringify([{ role: "user", content: promptText }]),
+          }
+        : {}),
+      model,
+    })
+    return
+  }
+
+  const runSpan = ctx.tracer.startSpan(
+    `${ctx.tracePrefix}session`,
+    {
+      startTime,
+      attributes: {
+        [OPENINFERENCE_SPAN_KIND]: OpenInferenceSpanKind.AGENT,
+        [SESSION_ID]: sessionID,
+        [AGENT_NAME]: agent,
+        "agent.type": "primary",
+        "session.is_subagent": false,
+        ...(promptText
+          ? {
+              [INPUT_VALUE]: promptText,
+              [INPUT_MIME_TYPE]: MimeType.TEXT,
+              [LLM_INPUT_MESSAGES]: JSON.stringify([{ role: "user", content: promptText }]),
+            }
+          : {}),
+        model,
+        ...ctx.commonAttrs,
+      },
+    },
+    ctx.rootContext(),
+  )
+  setBoundedMap(ctx.runSpans, sessionID, runSpan)
+  setBoundedMap(ctx.runSpanContexts, sessionID, runSpan.spanContext())
+  setBoundedMap(ctx.sessionRunRoots, sessionID, sessionID)
+}
 
 /** Increments the session counter, records start time, starts the root session span, and emits a `session.created` log event. */
 export function handleSessionCreated(e: EventSessionCreated, ctx: HandlerContext) {
@@ -18,16 +88,9 @@ export function handleSessionCreated(e: EventSessionCreated, ctx: HandlerContext
   }
   setBoundedMap(ctx.sessionTotals, sessionID, { startMs: createdAt, tokens: 0, cost: 0, messages: 0, agent: "unknown", agentType })
 
-  // WARNING: disabling "session" traces while "llm" or "tool" traces remain enabled
-  // leaves those child spans without a local session parent. If OPENCODE_TRACEPARENT
-  // is set, they fall back to that remote parent; otherwise they become root spans.
-  if (isTraceEnabled("session", ctx)) {
-    const parentSpan = parentID ? ctx.sessionSpans.get(parentID) : undefined
-    const baseCtx = ctx.rootContext()
-    const spanCtx = parentSpan
-      ? trace.setSpan(baseCtx, parentSpan)
-      : baseCtx
-
+  if (isTraceEnabled("session", ctx) && parentID) {
+    const runRootID = ctx.sessionRunRoots.get(parentID) ?? parentID
+    setBoundedMap(ctx.sessionRunRoots, sessionID, runRootID)
     const sessionSpan = ctx.tracer.startSpan(
       `${ctx.tracePrefix}session`,
       {
@@ -41,9 +104,10 @@ export function handleSessionCreated(e: EventSessionCreated, ctx: HandlerContext
           ...ctx.commonAttrs,
         },
       },
-      spanCtx,
+      resolveSessionTraceContext(parentID, ctx),
     )
     setBoundedMap(ctx.sessionSpans, sessionID, sessionSpan)
+    setBoundedMap(ctx.sessionSpanContexts, sessionID, sessionSpan.spanContext())
   }
 
   ctx.emitLog({
@@ -128,6 +192,21 @@ export function handleSessionIdle(e: EventSessionIdle, ctx: HandlerContext) {
     sessionSpan.end()
     ctx.sessionSpans.delete(sessionID)
   }
+  const runSpan = ctx.runSpans.get(sessionID)
+  if (runSpan) {
+    if (totals) {
+      runSpan.setAttributes({
+        [AGENT_NAME]: totals.agent,
+        "agent.type": totals.agentType,
+        "session.total_tokens": totals.tokens,
+        "session.total_cost_usd": totals.cost,
+        "session.total_messages": totals.messages,
+      })
+    }
+    runSpan.setStatus({ code: SpanStatusCode.OK })
+    runSpan.end()
+    ctx.runSpans.delete(sessionID)
+  }
 
   ctx.emitLog({
     severityNumber: SeverityNumber.INFO,
@@ -172,6 +251,14 @@ export function handleSessionError(e: EventSessionError, ctx: HandlerContext) {
       sessionSpan.setAttribute("error", error)
       sessionSpan.end()
       ctx.sessionSpans.delete(rawID)
+    }
+    const runSpan = ctx.runSpans.get(rawID)
+    if (runSpan) {
+      if (totals) runSpan.setAttributes({ [AGENT_NAME]: totals.agent, "agent.type": totals.agentType })
+      runSpan.setStatus({ code: SpanStatusCode.ERROR, message: error })
+      runSpan.setAttribute("error", error)
+      runSpan.end()
+      ctx.runSpans.delete(rawID)
     }
   }
 

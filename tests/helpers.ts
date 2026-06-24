@@ -36,6 +36,7 @@ export type SpySpan = {
   status: SpanStatus
   attributes: Record<string, unknown>
   parentSpan: SpySpan | undefined
+  parentSpanContext: SpanContext | undefined
   setStatus(status: SpanStatus): SpySpan
   setAttribute(key: string, value: unknown): SpySpan
   setAttributes(attrs: Attributes): SpySpan
@@ -80,7 +81,12 @@ function makePluginLog(): SpyPluginLog {
   return spy
 }
 
-function makeSpan(name: string, startTime?: number, parentSpan?: SpySpan): SpySpan {
+function makeSpan(
+  name: string,
+  startTime?: number,
+  parentSpan?: SpySpan,
+  parentSpanContext?: SpanContext,
+): SpySpan {
   const span: SpySpan = {
     name,
     startTime,
@@ -89,6 +95,7 @@ function makeSpan(name: string, startTime?: number, parentSpan?: SpySpan): SpySp
     status: { code: SpanStatusCode.UNSET },
     attributes: {},
     parentSpan,
+    parentSpanContext,
     setStatus(s) { span.status = s; return span },
     setAttribute(k, v) { span.attributes[k] = v; return span },
     setAttributes(attrs) { Object.assign(span.attributes, attrs); return span },
@@ -107,10 +114,12 @@ export function makeTracer(): SpyTracer {
     spans: [],
     startSpan(name, options, ctx) {
       const parentFromCtx = ctx ? trace.getSpan(ctx) as SpySpan | undefined : undefined
+      const parentSpanContext = ctx ? trace.getSpanContext(ctx) ?? undefined : undefined
       const span = makeSpan(
         name,
         typeof options?.startTime === "number" ? options.startTime : undefined,
         parentFromCtx,
+        parentSpanContext,
       )
       if (options?.attributes) Object.assign(span.attributes, options.attributes)
       tracer.spans.push(span)
@@ -209,7 +218,11 @@ export function makeCtx(
     tracer: tracer as unknown as Tracer,
     tracePrefix: "opencode.",
     rootContext: () => ROOT_CONTEXT,
+    runSpans: new Map(),
+    runSpanContexts: new Map(),
+    sessionRunRoots: new Map(),
     sessionSpans: new Map(),
+    sessionSpanContexts: new Map(),
     messageSpans: new Map(),
     sessionInputs: new Map(),
     messageOutputs: new Map(),

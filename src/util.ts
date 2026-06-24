@@ -1,3 +1,4 @@
+import { trace } from "@opentelemetry/api"
 import { MAX_PENDING } from "./types.ts"
 import type { HandlerContext, SessionAgentType } from "./types.ts"
 
@@ -20,6 +21,19 @@ export function setBoundedMap<K, V>(map: Map<K, V>, key: K, value: V) {
     if (firstKey !== undefined) map.delete(firstKey)
   }
   map.set(key, value)
+}
+
+export function resolveSessionTraceContext(sessionID: string, ctx: HandlerContext) {
+  const baseCtx = ctx.rootContext()
+  const sessionSpan = ctx.sessionSpans.get(sessionID)
+  if (sessionSpan) return trace.setSpan(baseCtx, sessionSpan)
+  const sessionSpanContext = ctx.sessionSpanContexts.get(sessionID)
+  if (sessionSpanContext) return trace.setSpanContext(baseCtx, sessionSpanContext)
+  const runRootID = ctx.sessionRunRoots.get(sessionID) ?? sessionID
+  const runSpan = ctx.runSpans.get(runRootID)
+  if (runSpan) return trace.setSpan(baseCtx, runSpan)
+  const runSpanContext = ctx.runSpanContexts.get(runRootID)
+  return runSpanContext ? trace.setSpanContext(baseCtx, runSpanContext) : baseCtx
 }
 
 /**

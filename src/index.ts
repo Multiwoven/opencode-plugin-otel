@@ -21,11 +21,12 @@ import { loadConfig, parseAttributePairs, resolveHelperPath, resolveLogLevel } f
 import { probeEndpoint } from "./probe.ts"
 import { setupOtel, createInstruments } from "./otel.ts"
 import { remoteParentContext } from "./trace-context.ts"
-import { handleSessionCreated, handleSessionIdle, handleSessionError, handleSessionStatus } from "./handlers/session.ts"
+import { handleSessionCreated, handleSessionIdle, handleSessionError, handleSessionStatus, handleRunStarted } from "./handlers/session.ts"
 import { handleMessageUpdated, handleMessagePartUpdated, startMessageSpan } from "./handlers/message.ts"
 import { handlePermissionUpdated, handlePermissionReplied } from "./handlers/permission.ts"
 import { handleSessionDiff, handleCommandExecuted } from "./handlers/activity.ts"
-import { agentAttrs, getSessionAgentMeta } from "./util.ts"
+import { agentAttrs, getSessionAgentMeta, setBoundedMap } from "./util.ts"
+import type { SessionTotals } from "./types.ts"
 
 const PLUGIN_VERSION: string = (pkg as { version?: string }).version ?? "unknown"
 
@@ -103,7 +104,11 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
   const pendingPermissions = new Map()
   const sessionTotals = new Map()
   const sessionDiffTotals = new Map()
+  const runSpans = new Map()
+  const runSpanContexts = new Map()
+  const sessionRunRoots = new Map()
   const sessionSpans = new Map()
+  const sessionSpanContexts = new Map()
   const messageSpans = new Map()
   const sessionInputs = new Map()
   const messageOutputs = new Map()
@@ -139,7 +144,11 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
     tracer,
     tracePrefix: config.metricPrefix,
     rootContext,
+    runSpans,
+    runSpanContexts,
+    sessionRunRoots,
     sessionSpans,
+    sessionSpanContexts,
     messageSpans,
     sessionInputs,
     messageOutputs,
@@ -183,9 +192,18 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
 
     "chat.message": safe("chat.message", async (input, output) => {
       const agent = input.agent ?? "unknown"
+      const startTime = Date.now()
+      const existingTotals = sessionTotals.get(input.sessionID)
+      const nextTotals: SessionTotals = {
+        startMs: existingTotals?.startMs ?? startTime,
+        tokens: existingTotals?.tokens ?? 0,
+        cost: existingTotals?.cost ?? 0,
+        messages: existingTotals?.messages ?? 0,
+        agent,
+        agentType: existingTotals?.agentType ?? "primary",
+      }
+      setBoundedMap(sessionTotals, input.sessionID, nextTotals)
       const { agentType } = getSessionAgentMeta(input.sessionID, ctx)
-      const totals = sessionTotals.get(input.sessionID)
-      if (totals) totals.agent = agent
       const sessionSpan = sessionSpans.get(input.sessionID)
       if (sessionSpan) sessionSpan.setAttributes({ [AGENT_NAME]: agent, "agent.type": agentType })
       const promptText = output.parts.map((part) => {
@@ -203,12 +221,22 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
         }
       }).filter(Boolean).join("\n")
       sessionInputs.set(input.sessionID, promptText)
+      if (!sessionSpan) {
+        handleRunStarted(
+          input.sessionID,
+          agent,
+          promptText,
+          input.model ? `${input.model.providerID}/${input.model.modelID}` : "unknown",
+          startTime,
+          ctx,
+        )
+      }
       const promptLength = promptText.length
       emitLog({
         severityNumber: SeverityNumber.INFO,
         severityText: "INFO",
-        timestamp: Date.now(),
-        observedTimestamp: Date.now(),
+        timestamp: startTime,
+        observedTimestamp: startTime,
         body: "user_prompt",
         attributes: {
           "event.name": "user_prompt",

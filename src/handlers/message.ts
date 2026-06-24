@@ -1,5 +1,5 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
-import { SpanStatusCode, SpanKind, trace } from "@opentelemetry/api"
+import { SpanStatusCode, SpanKind } from "@opentelemetry/api"
 import type { AssistantMessage, EventMessageUpdated, EventMessagePartUpdated, ToolPart } from "@opencode-ai/sdk"
 import {
   AGENT_NAME,
@@ -27,7 +27,16 @@ import {
   TOOL_NAME,
   TOOL_PARAMETERS,
 } from "@arizeai/openinference-semantic-conventions"
-import { agentAttrs, errorSummary, setBoundedMap, accumulateSessionTotals, getSessionAgentMeta, isMetricEnabled, isTraceEnabled } from "../util.ts"
+import {
+  agentAttrs,
+  errorSummary,
+  setBoundedMap,
+  accumulateSessionTotals,
+  getSessionAgentMeta,
+  isMetricEnabled,
+  isTraceEnabled,
+  resolveSessionTraceContext,
+} from "../util.ts"
 import type { HandlerContext } from "../types.ts"
 
 const OPENINFERENCE_SPAN_KIND = SemanticConventions.OPENINFERENCE_SPAN_KIND
@@ -260,11 +269,6 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
       const { agentName, agentType } = getSessionAgentMeta(toolPart.sessionID, ctx)
       const toolSpan = isTraceEnabled("tool", ctx)
         ? (() => {
-            const sessionSpan = ctx.sessionSpans.get(toolPart.sessionID)
-            const baseCtx = ctx.rootContext()
-            const parentCtx = sessionSpan
-              ? trace.setSpan(baseCtx, sessionSpan)
-              : baseCtx
             return ctx.tracer.startSpan(
               `${ctx.tracePrefix}tool.${toolPart.tool}`,
               {
@@ -283,7 +287,7 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
                   ...ctx.commonAttrs,
                 },
               },
-              parentCtx,
+              resolveSessionTraceContext(toolPart.sessionID, ctx),
             )
           })()
         : undefined
@@ -319,11 +323,6 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
 
     if (isTraceEnabled("tool", ctx)) {
       const toolSpan = pending?.span ?? (() => {
-        const sessionSpan = ctx.sessionSpans.get(toolPart.sessionID)
-        const baseCtx = ctx.rootContext()
-        const parentCtx = sessionSpan
-          ? trace.setSpan(baseCtx, sessionSpan)
-          : baseCtx
         return ctx.tracer.startSpan(
           `${ctx.tracePrefix}tool.${toolPart.tool}`,
           {
@@ -340,7 +339,7 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
               ...ctx.commonAttrs,
             },
           },
-          parentCtx,
+          resolveSessionTraceContext(toolPart.sessionID, ctx),
         )
       })()
       toolSpan.setAttributes({ [AGENT_NAME]: agentName, "agent.type": agentType })
@@ -403,8 +402,9 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
 
 /**
  * Starts an LLM span for an assistant message when it first appears in `message.updated`.
- * The span is parented to the session span and carries `gen_ai.*` semantic attributes for
- * the model and provider. It is ended in `handleMessageUpdated` once the message completes.
+ * The span is parented to the active run or subagent span and carries `gen_ai.*` semantic
+ * attributes for the model and provider. It is ended in `handleMessageUpdated` once the
+ * message completes.
  *
  * Only called for assistant messages that have not yet completed (`time.completed` absent).
  */
@@ -420,11 +420,6 @@ export function startMessageSpan(
   const msgKey = `${sessionID}:${messageID}`
   if (ctx.messageSpans.has(msgKey)) return
   const { agentName, agentType } = getSessionAgentMeta(sessionID, ctx)
-  const sessionSpan = ctx.sessionSpans.get(sessionID)
-  const baseCtx = ctx.rootContext()
-  const parentCtx = sessionSpan
-    ? trace.setSpan(baseCtx, sessionSpan)
-    : baseCtx
 
   const msgSpan = ctx.tracer.startSpan(
     `${ctx.tracePrefix}llm`,
@@ -449,7 +444,7 @@ export function startMessageSpan(
         ...ctx.commonAttrs,
       },
     },
-    parentCtx,
+    resolveSessionTraceContext(sessionID, ctx),
   )
   setBoundedMap(ctx.messageSpans, msgKey, msgSpan)
 }
