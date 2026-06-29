@@ -44,9 +44,16 @@ src/
 - **`setBoundedMap`** — always use this instead of `Map.set` for `pendingToolSpans` and `pendingPermissions` to prevent unbounded growth.
 - **Single source of truth for tokens/cost** — token and cost counters are incremented only in `message.updated` (`src/handlers/message.ts`), never in `step-finish`.
 - **Shutdown** — OTel providers are flushed via `SIGTERM`/`SIGINT`/`beforeExit`. Do not use `process.on("exit")` for async flushing.
-- **All env vars are `OPENCODE_` prefixed** — `OPENCODE_ENABLE_TELEMETRY`, `OPENCODE_OTLP_ENDPOINT`, `OPENCODE_OTLP_METRICS_INTERVAL`, `OPENCODE_OTLP_LOGS_INTERVAL`, `OPENCODE_METRIC_PREFIX`, `OPENCODE_OTLP_HEADERS`, `OPENCODE_RESOURCE_ATTRIBUTES`, `OPENCODE_SPAN_ATTRIBUTES`. Never use bare `OTEL_*` names for plugin config. `loadConfig` copies `OPENCODE_OTLP_HEADERS` → `OTEL_EXPORTER_OTLP_HEADERS` and `OPENCODE_RESOURCE_ATTRIBUTES` → `OTEL_RESOURCE_ATTRIBUTES` before the SDK initializes.
+- **All env vars are `OPENCODE_` prefixed** — `OPENCODE_ENABLE_TELEMETRY`, `OPENCODE_OTLP_ENDPOINT`, `OPENCODE_OTLP_METRICS_INTERVAL`, `OPENCODE_OTLP_LOGS_INTERVAL`, `OPENCODE_METRIC_PREFIX`, `OPENCODE_OTLP_HEADERS`, `OPENCODE_RESOURCE_ATTRIBUTES`, `OPENCODE_SPAN_ATTRIBUTES`, `OPENCODE_METRIC_ATTRIBUTES`, `OPENCODE_EXCLUDE_METRICS_ATTRIBUTES`, `OPENCODE_COST_USAGE_SCALE`. Never use bare `OTEL_*` names for plugin config. `loadConfig` copies `OPENCODE_OTLP_HEADERS` → `OTEL_EXPORTER_OTLP_HEADERS` and `OPENCODE_RESOURCE_ATTRIBUTES` → `OTEL_RESOURCE_ATTRIBUTES` before the SDK initializes.
+- **Attribute channels are per-signal and independent** — all parsed with `parseKeyValueAttributes` (`src/config.ts`):
+  - `OPENCODE_RESOURCE_ATTRIBUTES` → OTel `Resource` (producer metadata), applied in `buildResource` (`src/otel.ts`).
+  - `OPENCODE_SPAN_ATTRIBUTES` → **spans only**, threaded as `ctx.spanAttributes` and spread into each `tracer.startSpan` attribute block (session/llm/tool). Not in `commonAttrs`, so it never reaches logs or metrics.
+  - `OPENCODE_METRIC_ATTRIBUTES` → **metrics only**, merged via instrument wrapping in `createInstruments` (`src/otel.ts`); never touches spans or logs.
+  - `OPENCODE_EXCLUDE_METRICS_ATTRIBUTES` → **metrics only**, comma-separated attribute keys stripped from each metric data point in `createInstruments` (e.g. `session.id`); applied last so it always wins over `OPENCODE_METRIC_ATTRIBUTES`. Spans and logs are unaffected.
+  - `commonAttrs` (currently just `project.id`) is the only set applied to all three signals.
 - **`OPENCODE_ENABLE_TELEMETRY`** — all OTel instrumentation is gated on this env var. The plugin always loads regardless; only telemetry is disabled when unset.
 - **`OPENCODE_METRIC_PREFIX`** — defaults to `opencode.`; set to `claude_code.` for Claude Code dashboard compatibility.
+- **`OPENCODE_COST_USAGE_SCALE`** — positive number (default `1`); multiplier applied **only** to the `cost.usage` counter. Workaround for backends that round metric values to one decimal place server-side (e.g. AppSignal). The `session.cost.total` histogram, spans (`gen_ai.usage.cost`, `cost_usd` attributes), and log events all keep raw USD. Threaded through `HandlerContext.costUsageScale`; when ≠ 1, the `cost.usage` metric unit is reported as `USD/<scale>` and its description is annotated.
 
 ## Commit message format
 

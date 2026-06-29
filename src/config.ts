@@ -21,28 +21,35 @@ export type PluginConfig = {
   otlpHeaders: string | undefined
   otlpHeadersHelper: string | undefined
   resourceAttributes: string | undefined
-  spanAttributes: string | undefined
   traceparent: string | undefined
   tracestate: string | undefined
   metricsTemporality: MetricsTemporality | undefined
   disabledMetrics: Set<string>
   disabledTraces: Set<string>
+  spanAttributes: Record<string, string>
+  metricAttributes: Record<string, string>
+  excludeMetricAttributes: Set<string>
+  costUsageScale: number
 }
 
-export function parseAttributePairs(raw: string | undefined): Record<string, string> {
-  const attrs: Record<string, string> = {}
-  if (!raw) return attrs
-
+/**
+ * Parses a comma-separated `key=value` string into a record.
+ * Whitespace around keys and values is trimmed, pairs without a `=` (or with an
+ * empty key) are skipped, and only the first `=` is treated as the separator so
+ * values may themselves contain `=`. Returns an empty object when `raw` is unset.
+ */
+export function parseKeyValueAttributes(raw: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (!raw) return out
   for (const pair of raw.split(",")) {
     const idx = pair.indexOf("=")
-    if (idx <= 0) continue
-    const key = pair.slice(0, idx).trim()
-    const value = pair.slice(idx + 1).trim()
-    if (!key) continue
-    attrs[key] = value
+    if (idx > 0) {
+      const key = pair.slice(0, idx).trim()
+      const val = pair.slice(idx + 1).trim()
+      if (key) out[key] = val
+    }
   }
-
-  return attrs
+  return out
 }
 
 /** Parses a positive integer from an environment variable, returning `fallback` if absent or invalid. */
@@ -52,6 +59,18 @@ export function parseEnvInt(key: string, fallback: number): number {
   if (!/^[1-9]\d*$/.test(raw)) return fallback
   const n = Number(raw)
   return Number.isSafeInteger(n) ? n : fallback
+}
+
+/**
+ * Parses a positive finite number (integer or decimal) from an environment variable.
+ * Returns `fallback` when absent, non-numeric, zero, negative, or non-finite.
+ */
+export function parseEnvPositiveNumber(key: string, fallback: number): number {
+  const raw = process.env[key]
+  if (!raw) return fallback
+  if (!/^\d+(\.\d+)?$|^\.\d+$/.test(raw)) return fallback
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 ? n : fallback
 }
 
 /** Returns `true` when the environment variable is present and non-empty. */
@@ -84,7 +103,6 @@ export function loadConfig(): PluginConfig {
   const otlpHeaders = process.env["OPENCODE_OTLP_HEADERS"]
   const otlpHeadersHelper = process.env["OPENCODE_OTLP_HEADERS_HELPER"]
   const resourceAttributes = process.env["OPENCODE_RESOURCE_ATTRIBUTES"]
-  const spanAttributes = process.env["OPENCODE_SPAN_ATTRIBUTES"]
   const traceparent = process.env["OPENCODE_TRACEPARENT"]
   const tracestate = process.env["OPENCODE_TRACESTATE"]
   const rawTemporality = process.env["OPENCODE_OTLP_METRICS_TEMPORALITY"]
@@ -116,6 +134,24 @@ export function loadConfig(): PluginConfig {
 
   const disabledTraces = parseDisabledTraces(process.env["OPENCODE_DISABLE_TRACES"])
 
+  const rawCostUsageScale = process.env["OPENCODE_COST_USAGE_SCALE"]
+  const costUsageScale = parseEnvPositiveNumber("OPENCODE_COST_USAGE_SCALE", 1)
+  if (rawCostUsageScale && costUsageScale === 1 && rawCostUsageScale !== "1") {
+    console.warn(
+      `[opencode-plugin-otel] Invalid OPENCODE_COST_USAGE_SCALE="${rawCostUsageScale}". ` +
+        `Expected a positive number (e.g. 1000000). Value ignored.`,
+    )
+  }
+
+  const spanAttributes = parseKeyValueAttributes(process.env["OPENCODE_SPAN_ATTRIBUTES"])
+  const metricAttributes = parseKeyValueAttributes(process.env["OPENCODE_METRIC_ATTRIBUTES"])
+  const excludeMetricAttributes = new Set(
+    (process.env["OPENCODE_EXCLUDE_METRICS_ATTRIBUTES"] ?? "")
+      .split(",")
+      .map(s => s.trim())
+      .filter(Boolean),
+  )
+
   return {
     enabled: hasNonEmptyEnv("OPENCODE_ENABLE_TELEMETRY"),
     logsEnabled: !hasNonEmptyEnv("OPENCODE_DISABLE_LOGS"),
@@ -131,12 +167,15 @@ export function loadConfig(): PluginConfig {
     otlpHeaders,
     otlpHeadersHelper,
     resourceAttributes,
-    spanAttributes,
     traceparent,
     tracestate,
     metricsTemporality,
     disabledMetrics,
     disabledTraces,
+    spanAttributes,
+    metricAttributes,
+    excludeMetricAttributes,
+    costUsageScale,
   }
 }
 

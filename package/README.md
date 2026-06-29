@@ -20,11 +20,11 @@ An [opencode](https://opencode.ai) plugin that exports telemetry via OpenTelemet
   - [Disabling specific metrics](#disabling-specific-metrics)
   - [Disabling OTLP logs (`OPENCODE_DISABLE_LOGS`)](#disabling-otlp-logs)
   - [Disabling traces (`OPENCODE_DISABLE_TRACES`)](#disabling-traces)
+  - [Session finalization (debounced)](#session-finalization-debounced)
   - [SigNoz example](#signoz-example)
   - [Datadog example](#datadog-example)
   - [Honeycomb example](#honeycomb-example)
   - [Claude Code dashboard compatibility](#claude-code-dashboard-compatibility)
-  - [Scaling cost.usage for backends that round metric values (`OPENCODE_COST_USAGE_SCALE`)](#scaling-costusage-for-backends-that-round-metric-values)
 - [Local development](#local-development)
 - [GitHub Discord notifications](#github-discord-notifications)
 
@@ -42,10 +42,10 @@ An [opencode](https://opencode.ai) plugin that exports telemetry via OpenTelemet
 | `opencode.commit.count` | Counter | Git commits detected via bash tool |
 | `opencode.tool.duration` | Histogram | Tool execution time in milliseconds |
 | `opencode.cache.count` | Counter | Cache activity per message: `type=cacheRead` or `type=cacheCreation` |
-| `opencode.session.duration` | Histogram | Session duration from created to idle in milliseconds |
+| `opencode.session.duration` | Histogram | Session duration from created to idle in milliseconds, recorded once per session via a debounced finalize (see [Session finalization](#session-finalization-debounced)) |
 | `opencode.message.count` | Counter | Completed assistant messages per session |
-| `opencode.session.token.total` | Histogram | Total tokens consumed per session, recorded on idle |
-| `opencode.session.cost.total` | Histogram | Total cost per session in USD, recorded on idle |
+| `opencode.session.token.total` | Histogram | Total tokens consumed per session, recorded once per session via a debounced finalize (see [Session finalization](#session-finalization-debounced)) |
+| `opencode.session.cost.total` | Histogram | Total cost per session in USD, recorded once per session via a debounced finalize (see [Session finalization](#session-finalization-debounced)) |
 | `opencode.model.usage` | Counter | Messages per model and provider |
 | `opencode.retry.count` | Counter | API retries observed via `session.status` events |
 
@@ -105,7 +105,7 @@ All configuration is via environment variables. Set them in your shell profile (
 | `OPENCODE_METRIC_ATTRIBUTES` | *(unset)* | Comma-separated `key=value` pairs added to **metric data points only** (not spans, logs, or the resource). Example: `deployment.environment=production` |
 | `OPENCODE_EXCLUDE_METRICS_ATTRIBUTES` | *(unset)* | Comma-separated attribute keys stripped from **metric data points only** (not spans or logs). Applied last, so it always wins over `OPENCODE_METRIC_ATTRIBUTES`. Example: `session.id` to avoid high-cardinality session labels on counters and histograms |
 | `OPENCODE_OTLP_METRICS_TEMPORALITY` | *(unset)* | Metrics aggregation temporality: `delta`, `cumulative`, or `lowmemory`. Required for Datadog (`delta`). Copied to `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`. |
-| `OPENCODE_COST_USAGE_SCALE` | `1` | Multiplier applied to USD cost values before they are recorded as the `cost.usage` counter. Set to `1000000` for backends that round metric values to one decimal place (e.g. AppSignal) so per-message cents land as whole numbers. Only affects `cost.usage` — `session.cost.total`, spans, and log events keep raw USD. Divide by this value in dashboards to display dollars. |
+| `OPENCODE_SESSION_FINALIZE_DELAY_MS` | `60000` | Debounce delay before the three session-summary histograms (`session.duration`, `session.token.total`, `session.cost.total`) are recorded. Resets on any new `message.updated` / `message.part.updated`. See [Session finalization](#session-finalization-debounced). |
 | `OPENCODE_TRACEPARENT` | *(unset)* | W3C [`traceparent`](https://www.w3.org/TR/trace-context/#traceparent-header) string. When set, all spans are parented under this remote context so opencode traces nest inside a caller's trace (e.g. a CI job). Invalid values are logged and ignored. Note: with the default `ParentBased` sampler, a value with the sampled flag off (`...-00`) suppresses all trace export. |
 | `OPENCODE_TRACESTATE` | *(unset)* | W3C [`tracestate`](https://www.w3.org/TR/trace-context/#tracestate-header) string, parsed alongside `OPENCODE_TRACEPARENT` and attached to the remote parent context. Ignored unless a valid `OPENCODE_TRACEPARENT` is also set. |
 
@@ -229,6 +229,36 @@ export OPENCODE_DISABLE_TRACES="all"
 
 Accepted explicit "disable all traces" values are `all`, `*`, `true`, and `1`.
 
+### Session finalization (debounced)
+
+opencode emits `session.idle` every time a session transitions to idle — which in a long multi-turn conversation happens after every assistant turn, not just at the true end. To make the three session-summary histograms reflect the **full** session totals (not partial first-turn totals), the plugin defers their recording behind a debounce.
+
+What this means in practice:
+
+- On every `session.idle` event: the `session.idle` log event is emitted, the session span is ended, pending tool/permission state is swept, **and** a finalize timer is scheduled (default 60s).
+- Any subsequent `message.updated` or `message.part.updated` on the same session **cancels** the pending timer — the session is alive again.
+- After `OPENCODE_SESSION_FINALIZE_DELAY_MS` of inactivity, the timer fires and records the three session-summary histograms (`session.duration`, `session.token.total`, `session.cost.total`) with the true accumulated totals, then clears the session's totals.
+- `session.deleted` finalizes immediately (no wait).
+- On plugin shutdown (`SIGTERM` / `SIGINT` / `beforeExit`), every pending finalize is flushed before the OTel providers shut down, so nothing is lost on container teardown.
+
+Pick the delay based on your deployment shape:
+
+```bash
+# Long-running local opencode / TUI — leave the default
+# (sessions can sit idle for a while between turns)
+# OPENCODE_SESSION_FINALIZE_DELAY_MS=60000
+
+# Short-lived containers (Modal, Lambda, Cloud Run jobs) —
+# shorten the debounce so finalize fires before the container exits
+export OPENCODE_SESSION_FINALIZE_DELAY_MS=15000
+
+# Pair it with a short metrics export interval so the OTLP batch
+# flushes before teardown
+export OPENCODE_OTLP_METRICS_INTERVAL=5000
+```
+
+The per-message `opencode.cost.usage` counter is recorded synchronously and is **not** affected by this debounce — only the three per-session histograms are. To get per-session cost without waiting for finalize, sum `opencode.cost.usage` grouped by `session.id` in your dashboard.
+
 ### SigNoz example
 
 ```bash
@@ -278,21 +308,6 @@ export OPENCODE_OTLP_HEADERS="Authorization=Basic <base64-instance-id:api-key>"
 ```bash
 export OPENCODE_METRIC_PREFIX=claude_code.
 ```
-
-### Scaling cost.usage for backends that round metric values
-
-Some observability backends round metric values to one decimal place server-side (AppSignal is one example). Per-message cost values like `$0.023` then collapse to `0.0` and dashboards look empty.
-
-Use `OPENCODE_COST_USAGE_SCALE` to multiply the value sent to `cost.usage` so the integer part is meaningful. Only `cost.usage` is affected — `session.cost.total`, spans, and log events still carry the raw USD value.
-
-```bash
-# Scale to millionths of a dollar — $0.023 → 23000
-export OPENCODE_COST_USAGE_SCALE=1000000
-```
-
-When querying the metric, divide by the same factor to get dollars back. With `OPENCODE_COST_USAGE_SCALE=1000000`, a `cost.usage` value of `23000` is `$0.023`.
-
-The `cost.usage` `unit` is updated to `USD/1000000` (or whatever scale you set) and the description is annotated so the unit is visible in the backend's metric catalog.
 
 ## Local development
 

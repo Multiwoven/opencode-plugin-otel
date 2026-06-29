@@ -1,21 +1,33 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test"
-import { parseAttributePairs, parseEnvInt, loadConfig, resolveHelperPath, resolveLogLevel, TRACE_TYPES } from "../src/config.ts"
+import { parseEnvInt, parseEnvPositiveNumber, loadConfig, resolveHelperPath, resolveLogLevel, parseKeyValueAttributes, TRACE_TYPES } from "../src/config.ts"
 
-describe("parseAttributePairs", () => {
+describe("parseKeyValueAttributes", () => {
+  test("returns an empty object when undefined", () => {
+    expect(parseKeyValueAttributes(undefined)).toEqual({})
+  })
+
+  test("returns an empty object for an empty string", () => {
+    expect(parseKeyValueAttributes("")).toEqual({})
+  })
+
   test("parses comma-separated key=value pairs", () => {
-    expect(parseAttributePairs("team=platform,env=prod")).toEqual({ team: "platform", env: "prod" })
+    expect(parseKeyValueAttributes("a=1,b=2")).toEqual({ a: "1", b: "2" })
   })
 
-  test("trims whitespace and keeps empty values", () => {
-    expect(parseAttributePairs(" team = platform , empty = ")).toEqual({ team: "platform", empty: "" })
+  test("trims whitespace around keys and values", () => {
+    expect(parseKeyValueAttributes(" team = platform , env = prod ")).toEqual({ team: "platform", env: "prod" })
   })
 
-  test("uses only the first equals sign as the separator", () => {
-    expect(parseAttributePairs("auth=Bearer abc=123")).toEqual({ auth: "Bearer abc=123" })
+  test("keeps only the first = as the separator", () => {
+    expect(parseKeyValueAttributes("url=https://x.io/v1?a=b")).toEqual({ url: "https://x.io/v1?a=b" })
   })
 
-  test("ignores malformed pairs", () => {
-    expect(parseAttributePairs("missingequals,=novalue,,valid=yes")).toEqual({ valid: "yes" })
+  test("skips pairs without an = or with an empty key", () => {
+    expect(parseKeyValueAttributes("good=1,nope,=orphan")).toEqual({ good: "1" })
+  })
+
+  test("last value wins for duplicate keys", () => {
+    expect(parseKeyValueAttributes("k=1,k=2")).toEqual({ k: "2" })
   })
 })
 
@@ -58,6 +70,50 @@ describe("parseEnvInt", () => {
   afterEach(() => { delete process.env["TEST_INT"] })
 })
 
+describe("parseEnvPositiveNumber", () => {
+  afterEach(() => { delete process.env["TEST_NUM"] })
+
+  test("returns fallback when env var is unset", () => {
+    delete process.env["TEST_NUM"]
+    expect(parseEnvPositiveNumber("TEST_NUM", 1)).toBe(1)
+  })
+
+  test("parses a positive integer", () => {
+    process.env["TEST_NUM"] = "1000000"
+    expect(parseEnvPositiveNumber("TEST_NUM", 1)).toBe(1000000)
+  })
+
+  test("parses a positive decimal", () => {
+    process.env["TEST_NUM"] = "1.5"
+    expect(parseEnvPositiveNumber("TEST_NUM", 1)).toBe(1.5)
+  })
+
+  test("parses a leading-dot decimal", () => {
+    process.env["TEST_NUM"] = ".25"
+    expect(parseEnvPositiveNumber("TEST_NUM", 1)).toBe(0.25)
+  })
+
+  test("returns fallback for non-numeric value", () => {
+    process.env["TEST_NUM"] = "abc"
+    expect(parseEnvPositiveNumber("TEST_NUM", 1)).toBe(1)
+  })
+
+  test("returns fallback for zero", () => {
+    process.env["TEST_NUM"] = "0"
+    expect(parseEnvPositiveNumber("TEST_NUM", 1)).toBe(1)
+  })
+
+  test("returns fallback for negative value", () => {
+    process.env["TEST_NUM"] = "-5"
+    expect(parseEnvPositiveNumber("TEST_NUM", 1)).toBe(1)
+  })
+
+  test("returns fallback for trailing-garbage value", () => {
+    process.env["TEST_NUM"] = "1000x"
+    expect(parseEnvPositiveNumber("TEST_NUM", 1)).toBe(1)
+  })
+})
+
 describe("loadConfig", () => {
   const vars = [
     "OPENCODE_ENABLE_TELEMETRY",
@@ -68,13 +124,16 @@ describe("loadConfig", () => {
     "OPENCODE_OTLP_HEADERS",
     "OPENCODE_OTLP_HEADERS_HELPER",
     "OPENCODE_RESOURCE_ATTRIBUTES",
-    "OPENCODE_SPAN_ATTRIBUTES",
     "OPENCODE_TRACEPARENT",
     "OPENCODE_TRACESTATE",
     "OPENCODE_OTLP_METRICS_TEMPORALITY",
     "OPENCODE_DISABLE_METRICS",
     "OPENCODE_DISABLE_LOGS",
     "OPENCODE_DISABLE_TRACES",
+    "OPENCODE_SPAN_ATTRIBUTES",
+    "OPENCODE_METRIC_ATTRIBUTES",
+    "OPENCODE_EXCLUDE_METRICS_ATTRIBUTES",
+    "OPENCODE_COST_USAGE_SCALE",
     "OTEL_EXPORTER_OTLP_HEADERS",
     "OTEL_RESOURCE_ATTRIBUTES",
     "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
@@ -90,6 +149,86 @@ describe("loadConfig", () => {
     expect(cfg.protocol).toBe("grpc")
     expect(cfg.metricsInterval).toBe(60000)
     expect(cfg.logsInterval).toBe(5000)
+    expect(cfg.spanAttributes).toEqual({})
+    expect(cfg.metricAttributes).toEqual({})
+    expect(cfg.excludeMetricAttributes).toEqual(new Set())
+    expect(cfg.costUsageScale).toBe(1)
+  })
+
+  test("reads OPENCODE_COST_USAGE_SCALE", () => {
+    process.env["OPENCODE_COST_USAGE_SCALE"] = "1000000"
+    expect(loadConfig().costUsageScale).toBe(1000000)
+  })
+
+  test("falls back to 1 for invalid OPENCODE_COST_USAGE_SCALE and warns", () => {
+    const warnings: string[] = []
+    const origWarn = console.warn
+    console.warn = (...args: unknown[]) => warnings.push(String(args[0]))
+    try {
+      process.env["OPENCODE_COST_USAGE_SCALE"] = "nope"
+      const cfg = loadConfig()
+      expect(cfg.costUsageScale).toBe(1)
+      expect(warnings.length).toBe(1)
+      expect(warnings[0]).toContain("nope")
+    } finally {
+      console.warn = origWarn
+    }
+  })
+
+  test("does not warn when OPENCODE_COST_USAGE_SCALE is the literal value '1'", () => {
+    const warnings: string[] = []
+    const origWarn = console.warn
+    console.warn = (...args: unknown[]) => warnings.push(String(args[0]))
+    try {
+      process.env["OPENCODE_COST_USAGE_SCALE"] = "1"
+      const cfg = loadConfig()
+      expect(cfg.costUsageScale).toBe(1)
+      expect(warnings.length).toBe(0)
+    } finally {
+      console.warn = origWarn
+    }
+  })
+
+  test("falls back to 1 for zero or negative OPENCODE_COST_USAGE_SCALE", () => {
+    const origWarn = console.warn
+    console.warn = () => {}
+    try {
+      process.env["OPENCODE_COST_USAGE_SCALE"] = "0"
+      expect(loadConfig().costUsageScale).toBe(1)
+      process.env["OPENCODE_COST_USAGE_SCALE"] = "-5"
+      expect(loadConfig().costUsageScale).toBe(1)
+    } finally {
+      console.warn = origWarn
+    }
+  })
+
+  test("parses OPENCODE_SPAN_ATTRIBUTES into spanAttributes", () => {
+    process.env["OPENCODE_SPAN_ATTRIBUTES"] = "team=platform,env=prod"
+    expect(loadConfig().spanAttributes).toEqual({ team: "platform", env: "prod" })
+  })
+
+  test("parses OPENCODE_METRIC_ATTRIBUTES into metricAttributes", () => {
+    process.env["OPENCODE_METRIC_ATTRIBUTES"] = "deployment.environment=production"
+    expect(loadConfig().metricAttributes).toEqual({ "deployment.environment": "production" })
+  })
+
+  test("parses OPENCODE_EXCLUDE_METRICS_ATTRIBUTES into excludeMetricAttributes", () => {
+    process.env["OPENCODE_EXCLUDE_METRICS_ATTRIBUTES"] = "session.id, model"
+    expect(loadConfig().excludeMetricAttributes).toEqual(new Set(["session.id", "model"]))
+  })
+
+  test("spanAttributes and metricAttributes are parsed independently", () => {
+    process.env["OPENCODE_SPAN_ATTRIBUTES"] = "team=platform"
+    process.env["OPENCODE_METRIC_ATTRIBUTES"] = "env=prod"
+    const cfg = loadConfig()
+    expect(cfg.spanAttributes).toEqual({ team: "platform" })
+    expect(cfg.metricAttributes).toEqual({ env: "prod" })
+  })
+
+  test("does not copy OPENCODE_SPAN_ATTRIBUTES into OTEL_RESOURCE_ATTRIBUTES", () => {
+    process.env["OPENCODE_SPAN_ATTRIBUTES"] = "team=platform"
+    loadConfig()
+    expect(process.env["OTEL_RESOURCE_ATTRIBUTES"]).toBeUndefined()
   })
 
   test("enabled when OPENCODE_ENABLE_TELEMETRY is set", () => {
@@ -161,11 +300,6 @@ describe("loadConfig", () => {
     const cfg = loadConfig()
     expect(cfg.traceparent).toBe("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
     expect(cfg.tracestate).toBe("vendor=value")
-  })
-
-  test("reads OPENCODE_SPAN_ATTRIBUTES", () => {
-    process.env["OPENCODE_SPAN_ATTRIBUTES"] = "team=platform,env=prod"
-    expect(loadConfig().spanAttributes).toBe("team=platform,env=prod")
   })
 
   test("does not set OTEL_EXPORTER_OTLP_HEADERS when OPENCODE_OTLP_HEADERS is unset", () => {

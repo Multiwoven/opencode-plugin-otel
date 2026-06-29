@@ -6,27 +6,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and 
 
 ---
 
-## [1.2.1](https://github.com/DEVtheOPS/opencode-plugin-otel/compare/v1.2.0...v1.2.1) (2026-06-25)
-
-
-### Bug Fixes
-
-* **tracing:** key runs by user message id ([0e43ecc](https://github.com/DEVtheOPS/opencode-plugin-otel/commit/0e43ecc54d79916db50bd119d76efe8d61fad433))
-* **tracing:** scope root spans to runs ([8e8e5ca](https://github.com/DEVtheOPS/opencode-plugin-otel/commit/8e8e5ca78dac39da32016c1fe3eb8fac59625634))
-
-## [1.2.0](https://github.com/DEVtheOPS/opencode-plugin-otel/compare/v1.1.0...v1.2.0) (2026-06-20)
-
-
-### Features
-
-* **config:** support OPENCODE_SPAN_ATTRIBUTES ([93866c5](https://github.com/DEVtheOPS/opencode-plugin-otel/commit/93866c5b09788f3a3f1b9162be0ed028196c4e83))
-* **handlers:** add agent metadata to logs and spans ([c2759e9](https://github.com/DEVtheOPS/opencode-plugin-otel/commit/c2759e97401f1460ab8143cb04f2d0fb2fb05e29))
-
-
-### Bug Fixes
-
-* **config:** preserve canonical project.id ([0d02eac](https://github.com/DEVtheOPS/opencode-plugin-otel/commit/0d02eac390e307fd71cc270c63711f026815667b))
-
 ## [1.1.0](https://github.com/DEVtheOPS/opencode-plugin-otel/compare/v1.0.0...v1.1.0) (2026-06-04)
 
 

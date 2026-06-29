@@ -1,5 +1,6 @@
 import { logs } from "@opentelemetry/api-logs"
 import { metrics, trace } from "@opentelemetry/api"
+import type { Counter, Histogram, Gauge, Attributes, MetricOptions, Context } from "@opentelemetry/api"
 import { LoggerProvider, BatchLogRecordProcessor } from "@opentelemetry/sdk-logs"
 import { MeterProvider, PeriodicExportingMetricReader } from "@opentelemetry/sdk-metrics"
 import { BasicTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-base"
@@ -16,7 +17,6 @@ import { resourceFromAttributes } from "@opentelemetry/resources"
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions"
 import { ATTR_HOST_ARCH } from "@opentelemetry/semantic-conventions/incubating"
 import type { Instruments } from "./types.ts"
-import { parseAttributePairs } from "./config.ts"
 import {
   createGrpcMetadata,
   DynamicHeaders,
@@ -38,7 +38,17 @@ export function buildResource(version: string) {
     "app.version": version,
     "os.type": process.platform,
     [ATTR_HOST_ARCH]: process.arch,
-    ...parseAttributePairs(process.env["OTEL_RESOURCE_ATTRIBUTES"]),
+  }
+  const raw = process.env["OTEL_RESOURCE_ATTRIBUTES"]
+  if (raw) {
+    for (const pair of raw.split(",")) {
+      const idx = pair.indexOf("=")
+      if (idx > 0) {
+        const key = pair.slice(0, idx).trim()
+        const val = pair.slice(idx + 1).trim()
+        if (key) attrs[key] = val
+      }
+    }
   }
   return resourceFromAttributes(attrs)
 }
@@ -136,70 +146,116 @@ export async function setupOtel(
   return { meterProvider, loggerProvider, tracerProvider }
 }
 
-/** Creates all metric instruments using the global `MeterProvider`. Metric names are prefixed with `prefix`. */
-export function createInstruments(prefix: string): Instruments {
+/**
+ * Creates all metric instruments using the global `MeterProvider`. Metric names are
+ * prefixed with `prefix`. When `metricAttributes` is non-empty, every instrument is
+ * wrapped so those attributes are merged into each recorded data point (metrics only —
+ * spans and logs are unaffected). Sourced from `OPENCODE_METRIC_ATTRIBUTES`.
+ * Keys listed in `excludeMetricAttributes` (from `OPENCODE_EXCLUDE_METRICS_ATTRIBUTES`) are
+ * stripped from each data point last, so exclusion always wins over `metricAttributes`.
+ */
+export function createInstruments(
+  prefix: string,
+  metricAttributes: Record<string, string> = {},
+  excludeMetricAttributes: Set<string> = new Set(),
+  costUsageScale: number = 1,
+): Instruments {
   const meter = metrics.getMeter("com.opencode")
+  const hasExtra = Object.keys(metricAttributes).length > 0
+  const hasExclude = excludeMetricAttributes.size > 0
+  const needsWrap = hasExtra || hasExclude
+  const prepare = (attrs?: Attributes): Attributes | undefined => {
+    if (!needsWrap) return attrs
+    const result: Attributes = { ...(attrs ?? {}) }
+    if (hasExtra) {
+      Object.assign(result, metricAttributes)
+    }
+    // Exclusion is applied last so it always wins, regardless of whether the key
+    // came from the caller's attributes or from `metricAttributes`.
+    if (hasExclude) {
+      for (const key of excludeMetricAttributes) {
+        delete result[key]
+      }
+    }
+    return Object.keys(result).length > 0 ? result : undefined
+  }
+
+  const counter = (name: string, options: MetricOptions): Counter => {
+    const instrument = meter.createCounter(name, options)
+    if (!needsWrap) return instrument
+    return { add: (value: number, attrs?: Attributes, context?: Context) => instrument.add(value, prepare(attrs), context) } as Counter
+  }
+  const histogram = (name: string, options: MetricOptions): Histogram => {
+    const instrument = meter.createHistogram(name, options)
+    if (!needsWrap) return instrument
+    return { record: (value: number, attrs?: Attributes, context?: Context) => instrument.record(value, prepare(attrs), context) } as Histogram
+  }
+  const gauge = (name: string, options: MetricOptions): Gauge => {
+    const instrument = meter.createGauge(name, options)
+    if (!needsWrap) return instrument
+    return { record: (value: number, attrs?: Attributes, context?: Context) => instrument.record(value, prepare(attrs), context) } as Gauge
+  }
+
   return {
-    sessionCounter: meter.createCounter(`${prefix}session.count`, {
+    sessionCounter: counter(`${prefix}session.count`, {
       unit: "{session}",
       description: "Count of opencode sessions started",
     }),
-    tokenCounter: meter.createCounter(`${prefix}token.usage`, {
+    tokenCounter: counter(`${prefix}token.usage`, {
       unit: "tokens",
       description: "Number of tokens used",
     }),
-    costCounter: meter.createCounter(`${prefix}cost.usage`, {
-      unit: "USD",
-      description: "Cost of the opencode session in USD",
+    costCounter: counter(`${prefix}cost.usage`, {
+      unit: costUsageScale === 1 ? "USD" : `USD/${costUsageScale}`,
+      description: costUsageScale === 1
+        ? "Cost of the opencode session in USD"
+        : `Cost of the opencode session in USD, scaled by ${costUsageScale} (divide values by ${costUsageScale} for dollars). Set via OPENCODE_COST_USAGE_SCALE.`,
     }),
-    linesCounter: meter.createCounter(`${prefix}lines_of_code.count`, {
+    linesCounter: counter(`${prefix}lines_of_code.count`, {
       unit: "{line}",
       description: "Gross positive churn of lines added/removed across a session. Emits the positive delta vs. the previous session.diff; negative deltas (cumulative shrinkage) are dropped, so sums do not reconcile to net after any revert. Use lines_of_code.total for the authoritative live cumulative.",
     }),
-    linesTotalGauge: meter.createGauge(`${prefix}lines_of_code.total`, {
+    linesTotalGauge: gauge(`${prefix}lines_of_code.total`, {
       unit: "{line}",
       description: "Authoritative live cumulative lines added/removed for the current session. Mirrors opencode's session.diff cumulative value on every event; tracks partial and full reverts faithfully.",
     }),
-    commitCounter: meter.createCounter(`${prefix}commit.count`, {
+    commitCounter: counter(`${prefix}commit.count`, {
       unit: "{commit}",
       description: "Number of git commits created",
     }),
-    toolDurationHistogram: meter.createHistogram(`${prefix}tool.duration`, {
+    toolDurationHistogram: histogram(`${prefix}tool.duration`, {
       unit: "ms",
       description: "Duration of tool executions in milliseconds",
     }),
-    cacheCounter: meter.createCounter(`${prefix}cache.count`, {
+    cacheCounter: counter(`${prefix}cache.count`, {
       unit: "{request}",
       description: "Token cache activity (cacheRead/cacheCreation) per completed assistant message",
     }),
-    sessionDurationHistogram: meter.createHistogram(`${prefix}session.duration`, {
+    sessionDurationHistogram: histogram(`${prefix}session.duration`, {
       unit: "ms",
       description: "Duration of a session from created to idle in milliseconds",
     }),
-    messageCounter: meter.createCounter(`${prefix}message.count`, {
+    messageCounter: counter(`${prefix}message.count`, {
       unit: "{message}",
       description: "Number of completed assistant messages per session",
     }),
-    sessionTokenGauge: meter.createHistogram(`${prefix}session.token.total`, {
+    sessionTokenGauge: histogram(`${prefix}session.token.total`, {
       unit: "tokens",
       description: "Total tokens consumed per session, recorded as a histogram on session idle",
     }),
-    sessionCostGauge: meter.createHistogram(`${prefix}session.cost.total`, {
+    sessionCostGauge: histogram(`${prefix}session.cost.total`, {
       unit: "USD",
       description: "Total cost per session in USD, recorded as a histogram on session idle",
-      advice: {
-        explicitBucketBoundaries: [0.01, 0.05, 0.10, 0.25, 0.50, 1.00, 2.50, 5.00, 10.00, 25.00],
-      },
     }),
-    modelUsageCounter: meter.createCounter(`${prefix}model.usage`, {
+    modelUsageCounter: counter(`${prefix}model.usage`, {
       unit: "{request}",
       description: "Number of completed assistant messages per model and provider",
     }),
-    retryCounter: meter.createCounter(`${prefix}retry.count`, {
+    retryCounter: counter(`${prefix}retry.count`, {
       unit: "{retry}",
       description: "Number of API retries observed via session.status events",
     }),
-    subtaskCounter: meter.createCounter(`${prefix}subtask.count`, {
+    subtaskCounter: counter(`${prefix}subtask.count`, {
       unit: "{subtask}",
       description: "Number of sub-agent invocations observed via subtask message parts",
     }),

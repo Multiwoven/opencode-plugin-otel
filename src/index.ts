@@ -17,16 +17,14 @@ import type {
   EventCommandExecuted,
 } from "@opencode-ai/sdk"
 import { LEVELS, type Level, type HandlerContext } from "./types.ts"
-import { loadConfig, parseAttributePairs, resolveHelperPath, resolveLogLevel } from "./config.ts"
+import { loadConfig, resolveHelperPath, resolveLogLevel } from "./config.ts"
 import { probeEndpoint } from "./probe.ts"
 import { setupOtel, createInstruments } from "./otel.ts"
 import { remoteParentContext } from "./trace-context.ts"
-import { handleSessionCreated, handleSessionIdle, handleSessionError, handleSessionStatus, handleRunStarted } from "./handlers/session.ts"
+import { handleSessionCreated, handleSessionIdle, handleSessionError, handleSessionStatus } from "./handlers/session.ts"
 import { handleMessageUpdated, handleMessagePartUpdated, startMessageSpan } from "./handlers/message.ts"
 import { handlePermissionUpdated, handlePermissionReplied } from "./handlers/permission.ts"
 import { handleSessionDiff, handleCommandExecuted } from "./handlers/activity.ts"
-import { agentAttrs, getSessionAgentMeta, setBoundedMap } from "./util.ts"
-import type { SessionTotals } from "./types.ts"
 
 const PLUGIN_VERSION: string = (pkg as { version?: string }).version ?? "unknown"
 
@@ -64,7 +62,8 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
     headersSet: !!config.otlpHeaders,
     headersHelperSet: !!config.otlpHeadersHelper,
     resourceAttributesSet: !!config.resourceAttributes,
-    spanAttributesSet: !!config.spanAttributes,
+    spanAttributesSet: Object.keys(config.spanAttributes).length > 0,
+    metricAttributesSet: Object.keys(config.metricAttributes).length > 0,
   })
 
   const probe = await probeEndpoint(config.endpoint)
@@ -88,7 +87,7 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
   )
   await log("info", "OTel SDK initialized")
 
-  const instruments = createInstruments(config.metricPrefix)
+  const instruments = createInstruments(config.metricPrefix, config.metricAttributes, config.excludeMetricAttributes, config.costUsageScale)
   const logger = logs.getLogger("com.opencode")
   const emitLog: HandlerContext["emitLog"] = (record) => {
     if (!config.logsEnabled) return
@@ -104,21 +103,26 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
   const pendingPermissions = new Map()
   const sessionTotals = new Map()
   const sessionDiffTotals = new Map()
-  const runSpans = new Map()
-  const runSpanContexts = new Map()
-  const activeRuns = new Map()
-  const assistantRuns = new Map()
-  const pendingRuns = new Map()
-  const runInputs = new Map()
   const sessionSpans = new Map()
-  const sessionSpanContexts = new Map()
   const messageSpans = new Map()
+  const sessionInputs = new Map()
   const messageOutputs = new Map()
   const { disabledMetrics, disabledTraces } = config
-  const commonAttrs = {
-    ...parseAttributePairs(config.spanAttributes),
-    "project.id": project.id,
-  } as const
+  const commonAttrs = { "project.id": project.id } as const
+
+  const spanAttributeKeys = Object.keys(config.spanAttributes)
+  if (spanAttributeKeys.length > 0) {
+    await log("info", "custom span attributes applied", { keys: spanAttributeKeys })
+  }
+
+  const metricAttributeKeys = Object.keys(config.metricAttributes)
+  if (metricAttributeKeys.length > 0) {
+    await log("info", "custom metric attributes applied", { keys: metricAttributeKeys })
+  }
+
+  if (config.excludeMetricAttributes.size > 0) {
+    await log("info", "metric attributes excluded", { excluded: [...config.excludeMetricAttributes] })
+  }
 
   if (disabledMetrics.size > 0) {
     await log("info", "metrics disabled", { disabled: [...disabledMetrics] })
@@ -132,6 +136,13 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
     await log("info", "OTLP log events disabled")
   }
 
+  if (config.costUsageScale !== 1) {
+    await log("info", "cost.usage scaling enabled", {
+      costUsageScale: config.costUsageScale,
+      note: `cost.usage values are multiplied by ${config.costUsageScale}; divide by ${config.costUsageScale} in dashboards for dollars. session.cost.total is unaffected.`,
+    })
+  }
+
   const ctx: HandlerContext = {
     log,
     emitLog,
@@ -143,19 +154,15 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
     sessionDiffTotals,
     disabledMetrics,
     disabledTraces,
+    spanAttributes: config.spanAttributes,
     tracer,
     tracePrefix: config.metricPrefix,
     rootContext,
-    runSpans,
-    runSpanContexts,
-    activeRuns,
-    assistantRuns,
-    pendingRuns,
-    runInputs,
     sessionSpans,
-    sessionSpanContexts,
     messageSpans,
+    sessionInputs,
     messageOutputs,
+    costUsageScale: config.costUsageScale,
   }
 
   async function shutdown() {
@@ -196,20 +203,10 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
 
     "chat.message": safe("chat.message", async (input, output) => {
       const agent = input.agent ?? "unknown"
-      const startTime = Date.now()
-      const existingTotals = sessionTotals.get(input.sessionID)
-      const nextTotals: SessionTotals = {
-        startMs: existingTotals?.startMs ?? startTime,
-        tokens: existingTotals?.tokens ?? 0,
-        cost: existingTotals?.cost ?? 0,
-        messages: existingTotals?.messages ?? 0,
-        agent,
-        agentType: existingTotals?.agentType ?? "primary",
-      }
-      setBoundedMap(sessionTotals, input.sessionID, nextTotals)
-      const { agentType } = getSessionAgentMeta(input.sessionID, ctx)
+      const totals = sessionTotals.get(input.sessionID)
+      if (totals) totals.agent = agent
       const sessionSpan = sessionSpans.get(input.sessionID)
-      if (sessionSpan) sessionSpan.setAttributes({ [AGENT_NAME]: agent, "agent.type": agentType })
+      if (sessionSpan) sessionSpan.setAttribute(AGENT_NAME, agent)
       const promptText = output.parts.map((part) => {
         switch (part.type) {
           case "text":
@@ -224,38 +221,18 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
             return ""
         }
       }).filter(Boolean).join("\n")
-      if (!sessionSpan) {
-        const model = input.model ? `${input.model.providerID}/${input.model.modelID}` : "unknown"
-        if (input.messageID) {
-          handleRunStarted(
-            input.messageID,
-            input.sessionID,
-            agent,
-            promptText,
-            model,
-            startTime,
-            ctx,
-          )
-        } else {
-          setBoundedMap(pendingRuns, input.sessionID, {
-            agent,
-            promptText,
-            model,
-            startTime,
-          })
-        }
-      }
+      sessionInputs.set(input.sessionID, promptText)
       const promptLength = promptText.length
       emitLog({
         severityNumber: SeverityNumber.INFO,
         severityText: "INFO",
-        timestamp: startTime,
-        observedTimestamp: startTime,
+        timestamp: Date.now(),
+        observedTimestamp: Date.now(),
         body: "user_prompt",
         attributes: {
           "event.name": "user_prompt",
           "session.id": input.sessionID,
-          ...agentAttrs(agent, agentType),
+          agent,
           prompt_length: promptLength,
           model: input.model
             ? `${input.model.providerID}/${input.model.modelID}`
@@ -294,26 +271,10 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
         case "message.updated": {
           const msgEvt = event as EventMessageUpdated
           const info = msgEvt.properties.info
-          if (info.role === "user") {
-            const pendingRun = pendingRuns.get(info.sessionID)
-            if (!sessionSpans.has(info.sessionID) && (pendingRun || activeRuns.get(info.sessionID) !== info.id)) {
-              handleRunStarted(
-                info.id,
-                info.sessionID,
-                pendingRun?.agent ?? info.agent,
-                pendingRun?.promptText ?? "",
-                pendingRun?.model ?? `${info.model.providerID}/${info.model.modelID}`,
-                pendingRun?.startTime ?? info.time.created,
-                ctx,
-              )
-            }
-            break
-          }
           if (info.role === "assistant" && !info.time?.completed) {
             startMessageSpan(
               info.sessionID,
               info.id,
-              info.parentID,
               info.modelID ?? "unknown",
               info.providerID ?? "unknown",
               info.time?.created ?? Date.now(),
