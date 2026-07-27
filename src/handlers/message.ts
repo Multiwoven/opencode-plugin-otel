@@ -52,7 +52,7 @@ type SubtaskPart = {
   agent: string
 }
 
-/** Slack added before preferring the plugin's observed wall-clock duration over opencode's `state.time`, so event-latency jitter never flips healthy timings. */
+/** Minimum excess before the observed wall-clock window overrides opencode's `state.time`. */
 const OBSERVED_DURATION_SLACK_MS = 250
 
 /** Failure signatures that playwright tools print to output while still reporting a successful status. */
@@ -70,10 +70,8 @@ function playwrightFalseSuccess(tool: string, output: string) {
  * The `agent` attribute is sourced from the session totals, which are populated by the
  * `chat.message` hook when the user prompt is received.
  *
- * The LLM span ends at the message's last observed content activity (generation end)
- * rather than `time.completed`, which also covers the message's tool executions and
- * would otherwise book tool time as LLM time. Falls back to `time.completed` when no
- * content timestamp was observed.
+ * The LLM span ends at generation end (last observed content activity), not `time.completed`,
+ * which also covers the message's tool executions.
  */
 export function handleMessageUpdated(e: EventMessageUpdated, ctx: HandlerContext) {
   const msg = e.properties.info
@@ -261,18 +259,11 @@ export function handleMessageUpdated(e: EventMessageUpdated, ctx: HandlerContext
  * a `tool_result` log event. Also handles `subtask` parts, incrementing the sub-agent
  * invocation counter and emitting a `subtask_invoked` log event.
  *
- * For tool spans: on the FIRST `running` update a child span of the current session span is
- * started and stored in `pendingToolSpans` together with the wall-clock time this plugin
- * observed it. Repeat `running` updates for the same call are ignored: opencode re-emits
- * `running` with a restamped `time.start` (including one right before completion), so
- * last-write-wins would both leak orphan spans and collapse the measured window to ~0ms.
- * On `completed`/`error` the span is ended with appropriate status. Timing prefers the
- * plugin's observed wall-clock window whenever it exceeds opencode's `state.time` window
- * beyond a small slack: opencode has been seen stamping near-zero `state.time` durations
- * for commands that ran for many seconds, which previously booked tool time as LLM time.
- * A missing `state.time.end` no longer drops the span/metric/log; wall clock fills in.
- * Playwright tools additionally get their reported success cross-checked against known
- * failure signatures in the output (the MCP reports success with an error payload).
+ * For tool spans: only the first `running` update starts the child span — opencode re-emits
+ * `running` with a restamped `time.start` (including right before completion), which would
+ * otherwise leak orphan spans and collapse durations to ~0ms. On `completed`/`error` the span
+ * is ended; the plugin's observed wall-clock window wins over `state.time` when meaningfully
+ * longer, and playwright success is cross-checked against failure signatures in the output.
  */
 export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: HandlerContext) {
   const part = e.properties.part
@@ -492,8 +483,7 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
 /**
  * Starts an LLM span for an assistant message when it first appears in `message.updated`.
  * The span is parented to the active run or subagent span and carries `gen_ai.*` semantic
- * attributes for the model and provider. It is ended in `handleMessageUpdated` at the
- * message's generation end (last content activity), falling back to completion time.
+ * attributes for the model and provider. It is ended in `handleMessageUpdated`.
  *
  * Only called for assistant messages that have not yet completed (`time.completed` absent).
  */
