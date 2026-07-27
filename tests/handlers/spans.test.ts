@@ -348,7 +348,8 @@ describe("tool spans", () => {
 describe("message (LLM) spans", () => {
   test("startMessageSpan creates an llm span", () => {
     const { ctx, tracer } = makeCtx()
-    startMessageSpan("ses_1", "msg_1", "user_1", "claude-3-5-sonnet", "anthropic", 1000, ctx, "build")
+    ctx.sessionTotals.set("ses_1", { startMs: 0, tokens: 0, cost: 0, messages: 0, agent: "build", agentType: "primary" })
+    startMessageSpan("ses_1", "msg_1", "user_1", "claude-3-5-sonnet", "anthropic", 1000, ctx)
     expect(tracer.spans).toHaveLength(1)
     expect(tracer.spans[0]!.name).toBe("opencode.llm")
     expect(ctx.messageSpans.has("ses_1:msg_1")).toBe(true)

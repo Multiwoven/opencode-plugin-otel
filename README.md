@@ -149,6 +149,9 @@ Option keys mirror the resolved config and map to the environment variables:
 | `otlpHeadersHelper` | `OPENCODE_OTLP_HEADERS_HELPER` |
 | `resourceAttributes` | `OPENCODE_RESOURCE_ATTRIBUTES` |
 | `spanAttributes` | `OPENCODE_SPAN_ATTRIBUTES` |
+| `metricAttributes` | `OPENCODE_METRIC_ATTRIBUTES` |
+| `excludeMetricAttributes` | `OPENCODE_EXCLUDE_METRICS_ATTRIBUTES` (array, not a comma string) |
+| `costUsageScale` | `OPENCODE_COST_USAGE_SCALE` |
 | `traceparent` | `OPENCODE_TRACEPARENT` |
 | `tracestate` | `OPENCODE_TRACESTATE` |
 | `metricsTemporality` | `OPENCODE_OTLP_METRICS_TEMPORALITY` |

@@ -229,7 +229,7 @@ export function loadConfig(options: OtelPluginOptions = {}): PluginConfig {
     optionCostUsageScale === undefined
     && rawCostUsageScale
     && envCostUsageScale === 1
-    && rawCostUsageScale !== "1"
+    && Number(rawCostUsageScale) !== 1
   ) {
     console.warn(
       `[opencode-plugin-otel] Invalid OPENCODE_COST_USAGE_SCALE="${rawCostUsageScale}". ` +

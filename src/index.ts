@@ -194,9 +194,18 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
   }
 
   let shuttingDown = false
+  let lastFlushMs = 0
+  const MIN_OPPORTUNISTIC_FLUSH_INTERVAL_MS = 10_000
 
-  async function flushTelemetry(reason: string) {
+  async function flushTelemetry(reason: string, opts?: { debounce?: boolean }) {
     if (shuttingDown) return
+    if (opts?.debounce) {
+      const now = Date.now()
+      if (now - lastFlushMs < MIN_OPPORTUNISTIC_FLUSH_INTERVAL_MS) return
+      lastFlushMs = now
+    } else {
+      lastFlushMs = Date.now()
+    }
     await forceFlushOtel(providers)
     await log("debug", "otel: telemetry flushed", { reason })
   }
@@ -354,7 +363,7 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
                 info.sessionID,
                 pendingRun?.agent ?? info.agent,
                 pendingRun?.promptText ?? "",
-                pendingRun?.model ?? `${info.model.providerID}/${info.model.modelID}`,
+                pendingRun?.model ?? (info.model ? `${info.model.providerID}/${info.model.modelID}` : "unknown"),
                 pendingRun?.startTime ?? info.time.created,
                 ctx,
               )
@@ -370,12 +379,11 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
               info.providerID ?? "unknown",
               info.time?.created ?? Date.now(),
               ctx,
-              info.mode,
             )
           }
           await handleMessageUpdated(msgEvt, ctx)
           if (info.role === "assistant" && info.time?.completed) {
-            await flushTelemetry("message.completed")
+            await flushTelemetry("message.completed", { debounce: true })
           }
           break
         }

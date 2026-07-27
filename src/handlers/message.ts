@@ -444,7 +444,6 @@ export function startMessageSpan(
   providerID: string,
   startTime: number,
   ctx: HandlerContext,
-  agent?: string,
 ) {
   if (!isTraceEnabled("llm", ctx)) return
   const msgKey = `${sessionID}:${messageID}`
@@ -486,7 +485,7 @@ export function startMessageSpan(
     ...(ctx.llmRequestContexts.get(requestKey) ?? []),
     {
       messageID,
-      agent: agent ?? agentName,
+      agent: agentName,
       modelID,
       providerID,
       spanContext: msgSpan.spanContext(),
