@@ -25,6 +25,8 @@ export type PendingToolSpan = {
   tool: string
   sessionID: string
   startMs: number
+  /** Wall-clock time this plugin first observed the tool running, independent of opencode's `state.time`. */
+  observedStartMs: number
   span?: Span
 }
 
@@ -117,6 +119,10 @@ export type HandlerContext = {
   sessionSpanContexts: Map<string, SpanContext>
   messageSpans: Map<string, Span>
   messageOutputs: Map<string, string>
+  /** Wall-clock of the last text/reasoning content per assistant message; marks generation end. */
+  messageLastContentMs: Map<string, number>
+  /** Wall-clock when a message's first tool started; generation-end fallback for tool-only rounds. */
+  messageFirstToolMs: Map<string, number>
   llmRequestContexts: Map<string, LlmRequestContext[]>
   tracePropagationProviders: Set<string>
 }

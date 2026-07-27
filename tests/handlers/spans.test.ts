@@ -471,7 +471,7 @@ describe("orphaned span cleanup", () => {
     const { ctx } = makeCtx()
     const t = makeTracer()
     const span = t.startSpan("tool") as unknown as Span
-    ctx.pendingToolSpans.set("ses_other:call_1", { tool: "bash", sessionID: "ses_other", startMs: 0, span })
+    ctx.pendingToolSpans.set("ses_other:call_1", { tool: "bash", sessionID: "ses_other", startMs: 0, observedStartMs: 0, span })
     handleSessionCreated(makeSessionCreated("ses_1"), ctx)
     handleSessionIdle(makeSessionIdle("ses_1"), ctx)
     expect(ctx.pendingToolSpans.has("ses_other:call_1")).toBe(true)

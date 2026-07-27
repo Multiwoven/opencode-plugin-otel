@@ -52,11 +52,26 @@ type SubtaskPart = {
   agent: string
 }
 
+/** Minimum excess before the observed wall-clock window overrides opencode's `state.time`. */
+const OBSERVED_DURATION_SLACK_MS = 250
+
+/** Failure signatures that playwright tools print to output while still reporting a successful status. */
+const PLAYWRIGHT_FALSE_SUCCESS_RE
+  = /missing (system )?dependenc|executable doesn'?t exist|browser (was )?not (found|installed)|failed to launch|target closed|net::ERR_/i
+
+/** True when a playwright tool claims success but its output carries a known failure signature. */
+function playwrightFalseSuccess(tool: string, output: string) {
+  return tool.startsWith("playwright") && PLAYWRIGHT_FALSE_SUCCESS_RE.test(output)
+}
+
 /**
  * Handles a completed assistant message: increments token and cost counters, emits
  * either an `api_request` or `api_error` log event, and ends the LLM span for this message.
  * The `agent` attribute is sourced from the session totals, which are populated by the
  * `chat.message` hook when the user prompt is received.
+ *
+ * The LLM span ends at generation end (last observed content activity), not `time.completed`,
+ * which also covers the message's tool executions.
  */
 export function handleMessageUpdated(e: EventMessageUpdated, ctx: HandlerContext) {
   const msg = e.properties.info
@@ -158,10 +173,16 @@ export function handleMessageUpdated(e: EventMessageUpdated, ctx: HandlerContext
     } else {
       msgSpan.setStatus({ code: SpanStatusCode.OK })
     }
-    msgSpan.end(assistant.time.completed)
+    const genEnd = ctx.messageLastContentMs.get(msgKey) ?? ctx.messageFirstToolMs.get(msgKey)
+    const spanEnd = genEnd !== undefined && genEnd > assistant.time.created && genEnd < assistant.time.completed
+      ? genEnd
+      : assistant.time.completed
+    msgSpan.end(spanEnd)
     ctx.messageSpans.delete(msgKey)
     ctx.messageOutputs.delete(msgKey)
   }
+  ctx.messageLastContentMs.delete(msgKey)
+  ctx.messageFirstToolMs.delete(msgKey)
   const requestKey = `${sessionID}:${assistant.parentID}`
   const remainingRequests = ctx.llmRequestContexts.get(requestKey)?.filter(request => request.messageID !== assistant.id)
   if (remainingRequests?.length) {
@@ -238,9 +259,11 @@ export function handleMessageUpdated(e: EventMessageUpdated, ctx: HandlerContext
  * a `tool_result` log event. Also handles `subtask` parts, incrementing the sub-agent
  * invocation counter and emitting a `subtask_invoked` log event.
  *
- * For tool spans: on `running` a child span of the current session span is started and stored
- * in `pendingToolSpans`. On `completed`/`error` the span is ended with appropriate status.
- * If no `running` event was seen (out-of-order), a best-effort span is started and immediately ended.
+ * For tool spans: only the first `running` update starts the child span — opencode re-emits
+ * `running` with a restamped `time.start` (including right before completion), which would
+ * otherwise leak orphan spans and collapse durations to ~0ms. On `completed`/`error` the span
+ * is ended; the plugin's observed wall-clock window wins over `state.time` when meaningfully
+ * longer, and playwright success is cross-checked against failure signatures in the output.
  */
 export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: HandlerContext) {
   const part = e.properties.part
@@ -248,6 +271,12 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
   if (part.type === "text") {
     const key = `${part.sessionID}:${part.messageID}`
     ctx.messageOutputs.set(key, `${ctx.messageOutputs.get(key) ?? ""}${part.text}`)
+    setBoundedMap(ctx.messageLastContentMs, key, Date.now())
+    return
+  }
+
+  if (part.type === "reasoning") {
+    setBoundedMap(ctx.messageLastContentMs, `${part.sessionID}:${part.messageID}`, Date.now())
     return
   }
 
@@ -288,13 +317,20 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
     const key = `${toolPart.sessionID}:${toolPart.callID}`
 
     if (toolPart.state.status === "running") {
+      if (ctx.pendingToolSpans.has(key)) return
+      const observedStartMs = Date.now()
+      const startMs = (toolPart.state as { time?: { start?: number } }).time?.start ?? observedStartMs
+      const msgKey = `${toolPart.sessionID}:${toolPart.messageID}`
+      if (!ctx.messageFirstToolMs.has(msgKey)) {
+        setBoundedMap(ctx.messageFirstToolMs, msgKey, observedStartMs)
+      }
       const { agentName, agentType } = getSessionAgentMeta(toolPart.sessionID, ctx)
       const toolSpan = isTraceEnabled("tool", ctx)
         ? (() => {
             return ctx.tracer.startSpan(
               `${ctx.tracePrefix}tool.${toolPart.tool}`,
               {
-                startTime: toolPart.state.time.start,
+                startTime: startMs,
                 kind: SpanKind.INTERNAL,
                 attributes: {
                   [OPENINFERENCE_SPAN_KIND]: OpenInferenceSpanKind.TOOL,
@@ -319,7 +355,8 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
       setBoundedMap(ctx.pendingToolSpans, key, {
         tool: toolPart.tool,
         sessionID: toolPart.sessionID,
-        startMs: toolPart.state.time.start,
+        startMs,
+        observedStartMs,
         span: toolSpan,
       })
       ctx.log("debug", "otel: tool span started", { sessionID: toolPart.sessionID, tool: toolPart.tool, key })
@@ -330,11 +367,27 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
 
     const pending = ctx.pendingToolSpans.get(key)
     ctx.pendingToolSpans.delete(key)
-    const start = pending?.startMs ?? toolPart.state.time.start
-    const end = toolPart.state.time.end
-    if (end === undefined) return
-    const duration_ms = end - start
-    const success = toolPart.state.status === "completed"
+    const observedEndMs = Date.now()
+    const stateTime = (toolPart.state as { time?: { start?: number; end?: number } }).time
+    let start = pending?.startMs ?? stateTime?.start ?? pending?.observedStartMs ?? observedEndMs
+    let end = stateTime?.end ?? observedEndMs
+    if (pending && observedEndMs - pending.observedStartMs > end - start + OBSERVED_DURATION_SLACK_MS) {
+      start = pending.observedStartMs
+      end = observedEndMs
+    }
+    const duration_ms = Math.max(0, end - start)
+    const output = toolPart.state.status === "completed"
+      ? ((toolPart.state as { output?: string }).output ?? "")
+      : undefined
+    const stateError = toolPart.state.status === "error"
+      ? ((toolPart.state as { error?: string }).error ?? "unknown error")
+      : undefined
+    let success = toolPart.state.status === "completed"
+    let falseSuccessError: string | undefined
+    if (success && output && playwrightFalseSuccess(toolPart.tool, output)) {
+      success = false
+      falseSuccessError = `tool reported success but output contains a failure: ${output.slice(0, 200)}`
+    }
     const { agentName, agentType } = getSessionAgentMeta(toolPart.sessionID, ctx)
 
     if (isMetricEnabled("tool.duration", ctx)) {
@@ -373,17 +426,16 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
       toolSpan.setAttributes({ [AGENT_NAME]: agentName, "agent.type": agentType })
       toolSpan.setAttribute("tool.success", success)
       if (success) {
-        const output = (toolPart.state as { output: string }).output
         toolSpan.setAttributes({
-          [OUTPUT_VALUE]: output,
+          [OUTPUT_VALUE]: output ?? "",
           [OUTPUT_MIME_TYPE]: MimeType.TEXT,
         })
-        toolSpan.setAttribute("tool.result_size_bytes", Buffer.byteLength(output, "utf8"))
+        toolSpan.setAttribute("tool.result_size_bytes", Buffer.byteLength(output ?? "", "utf8"))
         toolSpan.setStatus({ code: SpanStatusCode.OK })
       } else {
-        const err = (toolPart.state as { error: string }).error
+        const err = falseSuccessError ?? stateError ?? "unknown error"
         toolSpan.setAttributes({
-          [OUTPUT_VALUE]: err,
+          [OUTPUT_VALUE]: output ?? err,
           [OUTPUT_MIME_TYPE]: MimeType.TEXT,
         })
         toolSpan.setAttribute("tool.error", err)
@@ -393,8 +445,8 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
     }
 
     const sizeAttr = success
-      ? { tool_result_size_bytes: Buffer.byteLength((toolPart.state as { output: string }).output, "utf8") }
-      : { error: (toolPart.state as { error: string }).error }
+      ? { tool_result_size_bytes: Buffer.byteLength(output ?? "", "utf8") }
+      : { error: falseSuccessError ?? stateError ?? "unknown error" }
 
     ctx.emitLog({
       severityNumber: success ? SeverityNumber.INFO : SeverityNumber.ERROR,
@@ -431,8 +483,7 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
 /**
  * Starts an LLM span for an assistant message when it first appears in `message.updated`.
  * The span is parented to the active run or subagent span and carries `gen_ai.*` semantic
- * attributes for the model and provider. It is ended in `handleMessageUpdated` once the
- * message completes.
+ * attributes for the model and provider. It is ended in `handleMessageUpdated`.
  *
  * Only called for assistant messages that have not yet completed (`time.completed` absent).
  */
