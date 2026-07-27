@@ -124,6 +124,8 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
   const sessionSpanContexts = new Map()
   const messageSpans = new Map()
   const messageOutputs = new Map()
+  const messageLastContentMs = new Map()
+  const messageFirstToolMs = new Map()
   const llmRequestContexts = new Map()
   const { disabledMetrics, disabledTraces } = config
   const commonAttrs = { "project.id": project.id } as const
@@ -189,6 +191,8 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
     sessionSpanContexts,
     messageSpans,
     messageOutputs,
+    messageLastContentMs,
+    messageFirstToolMs,
     llmRequestContexts,
     tracePropagationProviders: config.tracePropagationProviders,
   }

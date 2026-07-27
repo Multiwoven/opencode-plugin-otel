@@ -1,5 +1,5 @@
-import { describe, test, expect } from "bun:test"
-import { handleMessageUpdated, handleMessagePartUpdated } from "../../src/handlers/message.ts"
+import { describe, test, expect, afterEach } from "bun:test"
+import { handleMessageUpdated, handleMessagePartUpdated, startMessageSpan } from "../../src/handlers/message.ts"
 import { makeCtx } from "../helpers.ts"
 import type { EventMessageUpdated, EventMessagePartUpdated } from "@opencode-ai/sdk"
 
@@ -320,7 +320,7 @@ describe("handleMessagePartUpdated", () => {
     expect(ctx.pendingToolSpans.size).toBe(0)
   })
 
-  test("skips recording when time.end is undefined", async () => {
+  test("records with a wall-clock end when time.end is undefined", async () => {
     const { ctx, histograms } = makeCtx()
     const e = {
       type: "message.part.updated",
@@ -335,7 +335,9 @@ describe("handleMessagePartUpdated", () => {
       },
     } as unknown as EventMessagePartUpdated
     await handleMessagePartUpdated(e, ctx)
-    expect(histograms.tool.calls).toHaveLength(0)
+    expect(histograms.tool.calls).toHaveLength(1)
+    expect(histograms.tool.calls.at(0)!.attrs["success"]).toBe(true)
+    expect(histograms.tool.calls.at(0)!.value).toBeGreaterThanOrEqual(0)
   })
 })
 
@@ -456,5 +458,130 @@ describe("handleMessagePartUpdated — subtask parts", () => {
     await handleMessagePartUpdated(e, ctx)
     expect(counters.subtask.calls).toHaveLength(0)
     expect(histograms.tool.calls).toHaveLength(0)
+  })
+})
+
+describe("tool timing prefers the observed wall clock", () => {
+  const realNow = Date.now
+
+  afterEach(() => {
+    Date.now = realNow
+  })
+
+  test("uses the observed window when state.time collapses to near zero", async () => {
+    const { ctx, histograms, tracer } = makeCtx()
+    let nowMs = 100_000
+    Date.now = () => nowMs
+    await handleMessagePartUpdated(makeToolPartUpdated("running", { startMs: 50_000 }), ctx)
+    nowMs = 108_000
+    await handleMessagePartUpdated(makeToolPartUpdated("completed", { startMs: 50_000, endMs: 50_008 }), ctx)
+    expect(histograms.tool.calls).toHaveLength(1)
+    expect(histograms.tool.calls.at(0)!.value).toBe(8000)
+    const span = tracer.spans.find(s => s.name.includes("tool.bash"))
+    expect(span!.endTime).toBe(108_000)
+  })
+
+  test("keeps state.time when the observed window is not meaningfully longer", async () => {
+    const { ctx, histograms } = makeCtx()
+    await handleMessagePartUpdated(makeToolPartUpdated("running", { startMs: 1000 }), ctx)
+    await handleMessagePartUpdated(makeToolPartUpdated("completed", { startMs: 1000, endMs: 1500 }), ctx)
+    expect(histograms.tool.calls.at(0)!.value).toBe(500)
+  })
+
+  test("ignores restamped repeat running updates so the first observation wins", async () => {
+    const { ctx, histograms, tracer } = makeCtx()
+    let nowMs = 100_000
+    Date.now = () => nowMs
+    await handleMessagePartUpdated(makeToolPartUpdated("running", { startMs: 100_000 }), ctx)
+    nowMs = 100_040
+    await handleMessagePartUpdated(makeToolPartUpdated("running", { startMs: 100_039 }), ctx)
+    nowMs = 105_070
+    await handleMessagePartUpdated(makeToolPartUpdated("running", { startMs: 105_068 }), ctx)
+    nowMs = 105_080
+    await handleMessagePartUpdated(makeToolPartUpdated("completed", { startMs: 105_068, endMs: 105_078 }), ctx)
+    expect(histograms.tool.calls).toHaveLength(1)
+    expect(histograms.tool.calls.at(0)!.value).toBeGreaterThanOrEqual(5000)
+    const toolSpans = tracer.spans.filter(s => s.name.includes("tool.bash"))
+    expect(toolSpans).toHaveLength(1)
+    expect(toolSpans.at(0)!.ended).toBe(true)
+  })
+})
+
+describe("playwright success cross-check", () => {
+  const makePlaywrightCompleted = (output: string, tool = "playwright_browser_navigate"): EventMessagePartUpdated =>
+    ({
+      type: "message.part.updated",
+      properties: {
+        part: {
+          type: "tool",
+          sessionID: "ses_1",
+          callID: "call_pw",
+          tool,
+          messageID: "msg_1",
+          state: { status: "completed", time: { start: 1000, end: 1069 }, output },
+        },
+      },
+    }) as unknown as EventMessagePartUpdated
+
+  test("downgrades playwright success when the output carries a failure signature", async () => {
+    const { ctx, histograms, tracer } = makeCtx()
+    await handleMessagePartUpdated(
+      makePlaywrightCompleted("Error: browser was not found. Missing system dependencies for chromium."),
+      ctx,
+    )
+    expect(histograms.tool.calls.at(0)!.attrs["success"]).toBe(false)
+    const span = tracer.spans.find(s => s.name.includes("tool.playwright_browser_navigate"))
+    expect(span!.attributes["tool.success"]).toBe(false)
+    expect(span!.attributes["tool.error"]).toContain("failure")
+  })
+
+  test("keeps playwright success when the output is clean", async () => {
+    const { ctx, histograms } = makeCtx()
+    await handleMessagePartUpdated(makePlaywrightCompleted("Navigated to http://localhost:5173/"), ctx)
+    expect(histograms.tool.calls.at(0)!.attrs["success"]).toBe(true)
+  })
+
+  test("leaves non-playwright tools successful even when the output mentions an error", async () => {
+    const { ctx, histograms } = makeCtx()
+    await handleMessagePartUpdated(
+      makePlaywrightCompleted("grep: pattern matched line: error handling", "bash"),
+      ctx,
+    )
+    expect(histograms.tool.calls.at(0)!.attrs["success"]).toBe(true)
+  })
+})
+
+describe("llm span ends at generation end", () => {
+  const realNow = Date.now
+
+  afterEach(() => {
+    Date.now = realNow
+  })
+
+  const makeTextPart = (): EventMessagePartUpdated =>
+    ({
+      type: "message.part.updated",
+      properties: { part: { type: "text", text: "hello", sessionID: "ses_1", messageID: "msg_1" } },
+    }) as unknown as EventMessagePartUpdated
+
+  test("ends the llm span at the last text content, not message completion", async () => {
+    const { ctx, tracer } = makeCtx()
+    let nowMs = 5_000
+    Date.now = () => nowMs
+    startMessageSpan("ses_1", "msg_1", "usr_1", "claude-sonnet-5", "anthropic", 1_000, ctx)
+    nowMs = 6_000
+    await handleMessagePartUpdated(makeTextPart(), ctx)
+    await handleMessageUpdated(makeAssistantMessageUpdated({ time: { created: 1_000, completed: 30_000 } }), ctx)
+    const span = tracer.spans.find(s => s.name.endsWith("llm"))
+    expect(span!.ended).toBe(true)
+    expect(span!.endTime).toBe(6_000)
+  })
+
+  test("falls back to message completion when no content was observed", async () => {
+    const { ctx, tracer } = makeCtx()
+    startMessageSpan("ses_1", "msg_1", "usr_1", "claude-sonnet-5", "anthropic", 1_000, ctx)
+    await handleMessageUpdated(makeAssistantMessageUpdated({ time: { created: 1_000, completed: 30_000 } }), ctx)
+    const span = tracer.spans.find(s => s.name.endsWith("llm"))
+    expect(span!.endTime).toBe(30_000)
   })
 })
