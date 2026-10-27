@@ -129,6 +129,7 @@ describe("loadConfig", () => {
     "OPENCODE_OTLP_METRICS_TEMPORALITY",
     "OPENCODE_DISABLE_METRICS",
     "OPENCODE_DISABLE_LOGS",
+    "OPENCODE_CAPTURE_PROMPT_IN_LOGS",
     "OPENCODE_DISABLE_TRACES",
     "OPENCODE_SPAN_ATTRIBUTES",
     "OPENCODE_METRIC_ATTRIBUTES",
@@ -146,6 +147,7 @@ describe("loadConfig", () => {
     const cfg = loadConfig()
     expect(cfg.enabled).toBe(false)
     expect(cfg.logsEnabled).toBe(true)
+    expect(cfg.capturePromptInLogs).toBe(false)
     expect(cfg.endpoint).toBe("http://localhost:4317")
     expect(cfg.protocol).toBe("grpc")
     expect(cfg.metricsInterval).toBe(60000)
@@ -240,6 +242,11 @@ describe("loadConfig", () => {
   test("logsEnabled is false when OPENCODE_DISABLE_LOGS is set", () => {
     process.env["OPENCODE_DISABLE_LOGS"] = "1"
     expect(loadConfig().logsEnabled).toBe(false)
+  })
+
+  test("capturePromptInLogs is true when OPENCODE_CAPTURE_PROMPT_IN_LOGS is set", () => {
+    process.env["OPENCODE_CAPTURE_PROMPT_IN_LOGS"] = "1"
+    expect(loadConfig().capturePromptInLogs).toBe(true)
   })
 
   test("reads custom endpoint", () => {
